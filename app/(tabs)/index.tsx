@@ -1,13 +1,15 @@
 import { Image } from 'expo-image';
-import { Platform, StyleSheet } from 'react-native';
+import { Platform, Pressable, StyleSheet } from 'react-native';
 
 import { HelloWave } from '@/components/hello-wave';
 import ParallaxScrollView from '@/components/parallax-scroll-view';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Link } from 'expo-router';
+import { Link, useRouter } from 'expo-router';
 
 export default function HomeScreen() {
+  const router = useRouter();
+
   return (
     <ParallaxScrollView
       headerBackgroundColor={{ light: '#A1CEDC', dark: '#1D3D47' }}
@@ -20,6 +22,21 @@ export default function HomeScreen() {
       <ThemedView style={styles.titleContainer}>
         <ThemedText type="title">Welcome!</ThemedText>
         <HelloWave />
+      </ThemedView>
+
+      {/* Dev Diagnostics Button */}
+      <ThemedView style={styles.stepContainer}>
+        <Pressable
+          onPress={() => router.push('/dev/diagnostics')}
+          style={styles.diagnosticsButton}
+        >
+          <ThemedText style={styles.diagnosticsText}>
+            🔧 Agent Diagnostics
+          </ThemedText>
+        </Pressable>
+        <ThemedText style={{ fontSize: 12, color: '#64748b' }}>
+          Test your agent connectivity and configuration
+        </ThemedText>
       </ThemedView>
       <ThemedView style={styles.stepContainer}>
         <ThemedText type="subtitle">Step 1: Try it</ThemedText>
@@ -94,5 +111,17 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     position: 'absolute',
+  },
+  diagnosticsButton: {
+    backgroundColor: '#3b82f6',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  diagnosticsText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
   },
 });

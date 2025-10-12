@@ -1,0 +1,629 @@
+from __future__ import annotations
+import os, sys, logging, inspect
+from uagents import Agent, Context, Model
+
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+
+class Message(Model):
+    message: str
+
+SEED_PHRASE = os.getenv("SEED_PHRASE")
+AGENT_NAME = os.getenv("AGENT_NAME", "alice")
+AGENT_PORT = int(os.getenv("AGENT_PORT", "8020"))  # Different from FastAPI (8000)
+AGENT_ENDPOINT = os.getenv("AGENT_ENDPOINT")  # optional public URL
+
+if not SEED_PHRASE:
+    raise RuntimeError("SEED_PHRASE not set. Run: export SEED_PHRASE='your seed phrase …'")
+
+# Build kwargs based on the installed uAgents signature
+sig = inspect.signature(Agent.__init__)
+params = sig.parameters
+
+agent_kwargs = {"name": AGENT_NAME, "seed": SEED_PHRASE}
+if "mailbox" in params:
+    agent_kwargs["mailbox"] = True
+# Port arg name differs across versions
+if "port" in params:
+    agent_kwargs["port"] = AGENT_PORT
+elif "http_port" in params:
+    agent_kwargs["http_port"] = AGENT_PORT
+# Public endpoint if supported
+if AGENT_ENDPOINT and "endpoint" in params:
+    agent_kwargs["endpoint"] = AGENT_ENDPOINT
+
+agent = Agent(**agent_kwargs)
+
+print(f"[BOOT] Name={AGENT_NAME}  Address={agent.address}  Port={AGENT_PORT}", flush=True)
+if AGENT_ENDPOINT:
+    print(f"[BOOT] Public endpoint: {AGENT_ENDPOINT}", flush=True)
+else:
+    print("[BOOT] No AGENT_ENDPOINT provided; agent will still connect to Mailbox.", flush=True)
+
+@agent.on_message(model=Message)
+async def echo_handler(ctx: Context, msg: Message):
+    ctx.logger.info(f"Echoing: {msg.message}")
+    await ctx.send(msg.sender, Message(message=f"Echo: {msg.message}"))
+
+if __name__ == "__main__":
+    try:
+        print("[BOOT] Starting agent.run()…", flush=True)
+        agent.run()
+    except Exception as e:
+        print(f"[FATAL] Agent crashed: {e}", file=sys.stderr, flush=True)
+        raise
+import os
+import sys
+import time
+import json
+import logging
+import inspect
+from queue import Queue, Empty
+from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
+from typing import Optional, Dict, Any
+
+from uagents import Agent, Context, Model
+
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("bridge")
+
+# ---------- Env / Config ----------
+SEED_PHRASE = os.getenv("SEED_PHRASE")
+AGENT_NAME = os.getenv("AGENT_NAME", "EcoBridge")
+MAILBOX_PORT = int(os.getenv("AGENT_PORT", "8020"))   # mailbox agent's HTTP port
+HTTP_PORT = int(os.getenv("HTTP_PORT", "8000"))       # FastAPI port for the app
+AGENT_ENDPOINT = os.getenv("AGENT_ENDPOINT")          # optional public URL (not required)
+REMOTE_AGENT_ADDRESS = os.getenv("AGENTVERSE_AGENT_ADDRESS")  # hosted agent address (required)
+
+if not SEED_PHRASE:
+    raise RuntimeError("SEED_PHRASE not set. Run: export SEED_PHRASE='your seed phrase …'")
+if not REMOTE_AGENT_ADDRESS:
+    raise RuntimeError("AGENTVERSE_AGENT_ADDRESS not set. Run: export AGENTVERSE_AGENT_ADDRESS='agent1q...'" )
+
+# ---------- uAgents mailbox agent bootstrap (adaptive to version) ----------
+sig = inspect.signature(Agent.__init__)
+params = sig.parameters
+agent_kwargs = {"name": AGENT_NAME, "seed": SEED_PHRASE}
+
+if "mailbox" in params:
+    agent_kwargs["mailbox"] = True
+if "port" in params:
+    agent_kwargs["port"] = MAILBOX_PORT
+elif "http_port" in params:
+    agent_kwargs["http_port"] = MAILBOX_PORT
+if AGENT_ENDPOINT and "endpoint" in params:
+    agent_kwargs["endpoint"] = AGENT_ENDPOINT
+
+agent = Agent(**agent_kwargs)
+
+log.info(f"[BOOT] Name={AGENT_NAME} Address={agent.address} MailboxPort={MAILBOX_PORT}")
+if AGENT_ENDPOINT:
+    log.info(f"[BOOT] Public endpoint: {AGENT_ENDPOINT}")
+else:
+    log.info("[BOOT] No AGENT_ENDPOINT provided; relying on mailbox connectivity.")
+
+# ---------- Message Models shared with the hosted agent ----------
+class Co2Request(Model):
+    user_id: str
+    action: str
+    distance_km: Optional[float] = None
+
+class Co2Response(Model):
+    co2_saved_kg: float
+    message: str
+    engine: str = "asi_one"
+
+# ---------- Thread-safe bridge queue ----------
+# FastAPI thread will enqueue dicts: {payload: Co2Request-like dict, future: Future}
+_requests_q: "Queue[Dict[str, Any]]" = Queue(maxsize=1024)
+
+# ---------- Agent pump: forward queued HTTP requests to hosted agent ----------
+@agent.on_interval(period=0.2)
+async def pump_bridge(ctx: Context):
+    # Drain the queue quickly each tick
+    drained = 0
+    while True:
+        try:
+            item = _requests_q.get_nowait()
+        except Empty:
+            break
+        drained += 1
+
+        future: Future = item["future"]
+        payload: Dict[str, Any] = item["payload"]
+        req = Co2Request(**payload)
+        log.info(f"[BRIDGE] → Sending to hosted agent {REMOTE_AGENT_ADDRESS}: {payload}")
+
+        try:
+            # send_and_receive will await a Co2Response from the hosted agent
+            resp: Co2Response = await ctx.send_and_receive(REMOTE_AGENT_ADDRESS, req, timeout=25)
+            result = {
+                "user_id": req.user_id,
+                "action": req.action,
+                "co2_saved_kg": float(resp.co2_saved_kg),
+                "message": resp.message,
+                "agent_meta": {"engine": resp.engine, "timestamp": int(time.time())},
+            }
+            future.set_result(result)
+            log.info(f"[BRIDGE] ← Received response from hosted agent: {result}")
+        except Exception as e:
+            future.set_exception(e)
+            log.error(f"[BRIDGE] ✗ Failed to get response from hosted agent: {e}")
+
+    if drained:
+        log.debug(f"[BRIDGE] Pump processed {drained} item(s)")
+
+# ---------- Optional echo for quick manual tests ----------
+class Echo(Model):
+    message: str
+
+@agent.on_message(model=Echo)
+async def echo_handler(ctx: Context, msg: Echo):
+    ctx.logger.info(f"[ECHO] {msg.message}")
+    await ctx.send(msg.sender, Echo(message=f"Echo: {msg.message}"))
+
+# ---------- FastAPI app (runs in separate thread) ----------
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+api = FastAPI(title="EcoTrack Bridge API", version="1.0.0")
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@api.get("/health")
+def health():
+    return {"status": "ok", "ts": int(time.time()), "bridge_address": agent.address}
+
+@api.get("/debug/bridge")
+def debug_bridge():
+    return {
+        "remote_agent": REMOTE_AGENT_ADDRESS,
+        "mailbox_port": MAILBOX_PORT,
+        "http_port": HTTP_PORT,
+    }
+
+@api.post("/co2/savings")
+async def co2_savings(payload: Dict[str, Any]):
+    """
+    Accepts JSON: { user_id: str, action: str, distance_km?: number }
+    Forwards to hosted Agentverse agent via mailbox and returns its response.
+    """
+    required = {"user_id", "action"}
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise HTTPException(status_code=422, detail=f"Missing required field(s): {', '.join(missing)}")
+
+    # Create a Future to wait for the agent response
+    future: Future = Future()
+    item = {"payload": payload, "future": future}
+
+    try:
+        _requests_q.put(item, timeout=2)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Bridge is busy; try again.")
+
+    try:
+        # Wait up to 30s for the agent reply
+        result = future.result(timeout=30)
+        return result
+    except FuturesTimeoutError:
+        raise HTTPException(status_code=504, detail="Timed out waiting for agent response")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Agent error: {e}")
+
+def run_api():
+    log.info(f"[API] Starting FastAPI on 0.0.0.0:{HTTP_PORT}")
+    uvicorn.run(api, host="0.0.0.0", port=HTTP_PORT, log_level="info")
+
+# ---------- Main entry ----------
+if __name__ == "__main__":
+    # Start FastAPI in a background thread so we can also run the mailbox agent
+    import threading
+    t = threading.Thread(target=run_api, daemon=True)
+    t.start()
+
+    try:
+        log.info("[BOOT] Starting mailbox agent…")
+        agent.run()  # blocks; FastAPI continues in background
+    except Exception as e:
+        log.error(f"[FATAL] Agent crashed: {e}")
+        raise
+"""
+EcoTrack Mailbox Bridge
+- Runs a uAgents mailbox agent (Agentverse-connected)
+- Exposes a FastAPI REST API for the Expo app
+- Forwards requests to your hosted Agentverse agent via ctx.send_and_receive
+
+ENV VARS (required/optional):
+  SEED_PHRASE                  (required) seed for the local mailbox agent
+  AGENTVERSE_AGENT_ADDRESS     (required) address of the hosted agent on Agentverse
+  AGENT_NAME                   (optional) default "EcoBridge"
+  AGENT_PORT                   (optional) mailbox agent HTTP port (default 8020)
+  HTTP_PORT                    (optional) FastAPI port for the app (default 8010)
+  AGENT_ENDPOINT               (optional) public endpoint; if set, agent may start endpoint mode
+"""
+
+import os
+import time
+import inspect
+import logging
+from typing import Optional, Dict, Any
+from queue import Queue, Empty
+from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
+
+from uagents import Agent, Context, Model
+
+# ---------------- Logging ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("bridge")
+
+# ---------------- Env / Config ----------------
+SEED_PHRASE = os.getenv("SEED_PHRASE")
+AGENT_NAME = os.getenv("AGENT_NAME", "EcoBridge")
+MAILBOX_PORT = int(os.getenv("AGENT_PORT", "8020"))    # uAgents mailbox port
+HTTP_PORT = int(os.getenv("HTTP_PORT", "8010"))        # FastAPI for Expo app
+AGENT_ENDPOINT = os.getenv("AGENT_ENDPOINT")             # optional; avoid unless you intend endpoint mode
+REMOTE_AGENT_ADDRESS = os.getenv("AGENTVERSE_AGENT_ADDRESS")
+
+if not SEED_PHRASE:
+    raise RuntimeError("SEED_PHRASE not set. Run: export SEED_PHRASE='your seed phrase'")
+if not REMOTE_AGENT_ADDRESS:
+    raise RuntimeError("AGENTVERSE_AGENT_ADDRESS not set. Run: export AGENTVERSE_AGENT_ADDRESS='agent1q…'")
+
+# ---------------- Build mailbox agent ----------------
+sig = inspect.signature(Agent.__init__)
+params = sig.parameters
+agent_kwargs = {"name": AGENT_NAME, "seed": SEED_PHRASE}
+
+# Always enable mailbox mode when supported
+if "mailbox" in params:
+    agent_kwargs["mailbox"] = True
+# Port arg name differs across versions
+if "port" in params:
+    agent_kwargs["port"] = MAILBOX_PORT
+elif "http_port" in params:
+    agent_kwargs["http_port"] = MAILBOX_PORT
+# Only set endpoint if explicitly needed
+if AGENT_ENDPOINT and "endpoint" in params:
+    agent_kwargs["endpoint"] = AGENT_ENDPOINT
+    log.warning("[WARN] AGENT_ENDPOINT is set; endpoint mode may override mailbox behavior.")
+
+agent = Agent(**agent_kwargs)
+
+log.info(f"[BOOT] Name={AGENT_NAME} Address={agent.address} MailboxPort={MAILBOX_PORT}")
+if AGENT_ENDPOINT:
+    log.info(f"[BOOT] Public endpoint: {AGENT_ENDPOINT}")
+else:
+    log.info("[BOOT] No AGENT_ENDPOINT provided; relying on mailbox connectivity.")
+
+# ---------------- Message models ----------------
+class Co2Request(Model):
+    user_id: str
+    action: str
+    distance_km: Optional[float] = None
+
+class Co2Response(Model):
+    co2_saved_kg: float
+    message: str
+    engine: str = "asi_one"
+
+# ---------------- Bridge queue ----------------
+_requests_q: "Queue[Dict[str, Any]]" = Queue(maxsize=1024)
+
+# Periodic pump to forward queued HTTP requests to hosted agent
+@agent.on_interval(period=0.2)
+async def pump_bridge(ctx: Context):
+    processed = 0
+    while True:
+        try:
+            item = _requests_q.get_nowait()
+        except Empty:
+            break
+        processed += 1
+
+        future: Future = item["future"]
+        payload: Dict[str, Any] = item["payload"]
+        req = Co2Request(**payload)
+        log.info(f"[BRIDGE] → Sending to hosted agent {REMOTE_AGENT_ADDRESS}: {payload}")
+        try:
+            resp: Co2Response = await ctx.send_and_receive(REMOTE_AGENT_ADDRESS, req, timeout=25)
+            result = {
+                "user_id": req.user_id,
+                "action": req.action,
+                "co2_saved_kg": float(resp.co2_saved_kg),
+                "message": resp.message,
+                "agent_meta": {"engine": resp.engine, "timestamp": int(time.time())},
+            }
+            future.set_result(result)
+            log.info(f"[BRIDGE] ← Received response from hosted agent: {result}")
+        except Exception as e:
+            future.set_exception(e)
+            log.error(f"[BRIDGE] ✗ Failed to get response from hosted agent: {e}")
+
+# ---------------- Optional echo for quick manual tests ----------------
+class Echo(Model):
+    message: str
+
+@agent.on_message(model=Echo)
+async def echo_handler(ctx: Context, msg: Echo):
+    ctx.logger.info(f"[ECHO] {msg.message}")
+    await ctx.send(msg.sender, Echo(message=f"Echo: {msg.message}"))
+
+# ---------------- FastAPI app ----------------
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+api = FastAPI(title="EcoTrack Bridge API", version="1.0.0")
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@api.get("/health")
+def health():
+    return {"status": "ok", "ts": int(time.time()), "bridge_address": agent.address}
+
+@api.get("/debug/bridge")
+def debug_bridge():
+    return {
+        "remote_agent": REMOTE_AGENT_ADDRESS,
+        "mailbox_port": MAILBOX_PORT,
+        "http_port": HTTP_PORT,
+    }
+
+@api.post("/co2/savings")
+async def co2_savings(payload: Dict[str, Any]):
+    required = {"user_id", "action"}
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise HTTPException(status_code=422, detail=f"Missing required field(s): {', '.join(missing)}")
+
+    future: Future = Future()
+    item = {"payload": payload, "future": future}
+
+    try:
+        _requests_q.put(item, timeout=2)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Bridge is busy; try again.")
+
+    try:
+        result = future.result(timeout=30)
+        return result
+    except FuturesTimeoutError:
+        raise HTTPException(status_code=504, detail="Timed out waiting for agent response")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Agent error: {e}")
+
+
+def run_api():
+    log.info(f"[API] Starting FastAPI on 0.0.0.0:{HTTP_PORT}")
+    uvicorn.run(api, host="0.0.0.0", port=HTTP_PORT, log_level="info")
+
+# ---------------- Main ----------------
+if __name__ == "__main__":
+    import threading
+
+    # Start FastAPI in a background thread so the mailbox agent can run in the main thread
+    t = threading.Thread(target=run_api, daemon=True)
+    t.start()
+
+    try:
+        log.info("[BOOT] Starting mailbox agent…")
+        agent.run()  # blocks; FastAPI continues in background
+    except Exception as e:
+        log.error(f"[FATAL] Agent crashed: {e}")
+        raise
+"""
+EcoTrack Mailbox Bridge
+- FastAPI for the mobile app (HTTP_PORT, default 8010)
+- uAgents mailbox agent (AGENT_PORT, default 8020) with mailbox=True
+- Forwards POST /co2/savings to your hosted Agentverse agent via ctx.send_and_receive
+
+Required env vars:
+  SEED_PHRASE                  seed for the local mailbox agent
+  AGENTVERSE_AGENT_ADDRESS     address of the hosted agent on Agentverse (agent1q...)
+
+Optional env vars:
+  AGENT_NAME                   default "EcoBridge"
+  AGENT_PORT                   default 8020 (mailbox agent HTTP port)
+  HTTP_PORT                    default 8010 (FastAPI port for Expo app)
+  AGENT_ENDPOINT               DO NOT set unless you intend endpoint mode
+"""
+
+
+import os
+import time
+import inspect
+import logging
+from typing import Optional, Dict, Any
+from queue import Queue, Empty
+from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
+
+from uagents import Agent, Context, Model
+
+# ---------------- Logging ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("bridge")
+
+# ---------------- Env / Config ----------------
+SEED_PHRASE = os.getenv("SEED_PHRASE")
+AGENT_NAME = os.getenv("AGENT_NAME", "EcoBridge")
+MAILBOX_PORT = int(os.getenv("AGENT_PORT", "8020"))   # uAgents mailbox port
+HTTP_PORT = int(os.getenv("HTTP_PORT", "8010"))       # FastAPI port for the app
+AGENT_ENDPOINT = os.getenv("AGENT_ENDPOINT")            # optional; avoid unless endpoint mode desired
+REMOTE_AGENT_ADDRESS = os.getenv("AGENTVERSE_AGENT_ADDRESS")
+
+if not SEED_PHRASE:
+    raise RuntimeError("SEED_PHRASE not set. export SEED_PHRASE='your seed phrase'")
+if not REMOTE_AGENT_ADDRESS:
+    raise RuntimeError("AGENTVERSE_AGENT_ADDRESS not set. export AGENTVERSE_AGENT_ADDRESS='agent1q…'")
+
+# ---------------- Build mailbox agent ----------------
+sig = inspect.signature(Agent.__init__)
+params = sig.parameters
+agent_kwargs = {"name": AGENT_NAME, "seed": SEED_PHRASE}
+
+# Force mailbox mode when supported
+if "mailbox" in params:
+    agent_kwargs["mailbox"] = True
+# Port arg name differs across versions
+if "port" in params:
+    agent_kwargs["port"] = MAILBOX_PORT
+elif "http_port" in params:
+    agent_kwargs["http_port"] = MAILBOX_PORT
+# Do NOT set endpoint unless explicitly intended (it can override mailbox behavior)
+if AGENT_ENDPOINT and "endpoint" in params:
+    agent_kwargs["endpoint"] = AGENT_ENDPOINT
+    log.warning("[WARN] AGENT_ENDPOINT is set; endpoint mode may override mailbox behavior.")
+
+agent = Agent(**agent_kwargs)
+
+log.info(f"[BOOT] Name={AGENT_NAME} Address={agent.address} MailboxPort={MAILBOX_PORT}")
+if AGENT_ENDPOINT:
+    log.info(f"[BOOT] Public endpoint: {AGENT_ENDPOINT}")
+else:
+    log.info("[BOOT] No AGENT_ENDPOINT provided; relying on mailbox connectivity.")
+
+# ---------------- Message models ----------------
+class Co2Request(Model):
+    user_id: str
+    action: str
+    distance_km: Optional[float] = None
+
+class Co2Response(Model):
+    co2_saved_kg: float
+    message: str
+    engine: str = "asi_one"
+
+# ---------------- Bridge queue ----------------
+_requests_q: "Queue[Dict[str, Any]]" = Queue(maxsize=1024)
+
+# Periodic pump to forward queued HTTP requests to hosted agent
+@agent.on_interval(period=0.2)
+async def pump_bridge(ctx: Context):
+    processed = 0
+    while True:
+        try:
+            item = _requests_q.get_nowait()
+        except Empty:
+            break
+        processed += 1
+
+        future: Future = item["future"]
+        payload: Dict[str, Any] = item["payload"]
+        req = Co2Request(**payload)
+        log.info(f"[BRIDGE] → Sending to hosted agent {REMOTE_AGENT_ADDRESS}: {payload}")
+        try:
+            resp: Co2Response = await ctx.send_and_receive(REMOTE_AGENT_ADDRESS, req, timeout=25)
+            result = {
+                "user_id": req.user_id,
+                "action": req.action,
+                "co2_saved_kg": float(resp.co2_saved_kg),
+                "message": resp.message,
+                "agent_meta": {"engine": resp.engine, "timestamp": int(time.time())},
+            }
+            future.set_result(result)
+            log.info(f"[BRIDGE] ← Received response from hosted agent: {result}")
+        except Exception as e:
+            future.set_exception(e)
+            log.error(f"[BRIDGE] ✗ Failed to get response from hosted agent: {e}")
+
+# ---------------- Optional echo for quick manual tests ----------------
+class Echo(Model):
+    message: str
+
+@agent.on_message(model=Echo)
+async def echo_handler(ctx: Context, msg: Echo):
+    ctx.logger.info(f"[ECHO] {msg.message}")
+    await ctx.send(msg.sender, Echo(message=f"Echo: {msg.message}"))
+
+# ---------------- FastAPI app ----------------
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+api = FastAPI(title="EcoTrack Bridge API", version="1.0.0")
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@api.get("/health")
+def health():
+    return {"status": "ok", "ts": int(time.time()), "bridge_address": agent.address}
+
+@api.get("/debug/bridge")
+def debug_bridge():
+    return {
+        "remote_agent": REMOTE_AGENT_ADDRESS,
+        "mailbox_port": MAILBOX_PORT,
+        "http_port": HTTP_PORT,
+    }
+
+@api.post("/co2/savings")
+async def co2_savings(payload: Dict[str, Any]):
+    required = {"user_id", "action"}
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise HTTPException(status_code=422, detail=f"Missing required field(s): {', '.join(missing)}")
+
+    future: Future = Future()
+    item = {"payload": payload, "future": future}
+
+    try:
+        _requests_q.put(item, timeout=2)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Bridge is busy; try again.")
+
+    try:
+        result = future.result(timeout=30)
+        return result
+    except FuturesTimeoutError:
+        raise HTTPException(status_code=504, detail="Timed out waiting for agent response")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Agent error: {e}")
+
+
+def run_api():
+    log.info(f"[API] Starting FastAPI on 0.0.0.0:{HTTP_PORT}")
+    uvicorn.run(api, host="0.0.0.0", port=HTTP_PORT, log_level="info")
+
+# ---------------- Main ----------------
+if __name__ == "__main__":
+    import threading
+
+    # Start FastAPI in a background thread so the mailbox agent can run in the main thread
+    t = threading.Thread(target=run_api, daemon=True)
+    t.start()
+
+    try:
+        log.info("[BOOT] Starting mailbox agent…")
+        agent.run()  # blocks; FastAPI continues in background
+    except Exception as e:
+        log.error(f"[FATAL] Agent crashed: {e}")
+        raise
